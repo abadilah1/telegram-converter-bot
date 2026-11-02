@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: word-pdf-converter-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
