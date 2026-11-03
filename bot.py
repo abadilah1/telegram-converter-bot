@@ -6,14 +6,19 @@ otherwise polling (local testing).
 """
 
 import asyncio
+import csv
 import html
+import io
 import logging
 import os
 import shutil
 import tempfile
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import httpx
 
 from telegram import (
     InlineKeyboardButton,
@@ -22,9 +27,11 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -42,6 +49,9 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "8"))
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "120"))
 BRAND = os.getenv("BRAND_NAME", "©A.B Digital Solutions")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 WORD_EXTS = {".doc", ".docx", ".odt", ".rtf"}
 PDF_EXT = ".pdf"
@@ -153,6 +163,270 @@ async def send(update: Update, text: str, markup=None) -> None:
         reply_markup=markup,
         disable_web_page_preview=True,
     )
+
+
+# --------------------------------------------------------------------------
+# Subscriber tracking (Upstash Redis, free tier). Optional: if the two
+# UPSTASH_* variables are not set, the bot works normally without tracking.
+# --------------------------------------------------------------------------
+
+async def redis(*commands):
+    """Run Redis commands in one request. Returns a list of results or None."""
+    if not (REDIS_URL and REDIS_TOKEN):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(
+                f"{REDIS_URL}/pipeline",
+                headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                json=[[str(part) for part in cmd] for cmd in commands],
+            )
+            resp.raise_for_status()
+            return [item.get("result") for item in resp.json()]
+    except Exception:  # noqa: BLE001
+        log.warning("Redis request failed", exc_info=True)
+        return None
+
+
+def _day(offset: int = 0) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=offset)).strftime("%Y-%m-%d")
+
+
+async def track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record every user who messages the bot; alert the admin on new users."""
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    uid = user.id
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    res = await redis(
+        ["SADD", "users", uid],
+        ["SADD", f"active:{_day()}", uid],
+        ["EXPIRE", f"active:{_day()}", 40 * 86400],
+        ["HSETNX", f"user:{uid}", "first_seen", now],
+        ["HSET", f"user:{uid}", "name", user.full_name or "", "username",
+         user.username or "", "last_seen", now],
+        ["SREM", "blocked", uid],
+    )
+    if res and res[0] == 1 and ADMIN_ID:
+        total = (await redis(["SCARD", "users"]) or [None])[0]
+        who = html.escape(user.full_name or "Someone")
+        handle = f" (@{html.escape(user.username)})" if user.username else ""
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"🆕 New subscriber: <b>{who}</b>{handle}\nTotal users: <b>{total}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def on_block_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark users who block or unblock the bot."""
+    change = update.my_chat_member
+    if not change or change.chat.type != "private":
+        return
+    uid = change.chat.id
+    if change.new_chat_member.status in ("kicked", "left"):
+        await redis(["SADD", "blocked", uid])
+    else:
+        await redis(["SREM", "blocked", uid])
+
+
+async def count_conversion(kind: str) -> None:
+    await redis(["INCR", f"stat:{kind}"], ["INCR", f"stat:{kind}:{_day()}"])
+
+
+def _is_admin(update: Update) -> bool:
+    return bool(ADMIN_ID) and update.effective_user.id == ADMIN_ID
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        return
+    if not (REDIS_URL and REDIS_TOKEN):
+        await send(update, "⚠️ Tracking isn't set up yet. Add the Upstash variables on Render.")
+        return
+    week_keys = [f"active:{_day(i)}" for i in range(7)]
+    res = await redis(
+        ["SCARD", "users"],
+        ["SCARD", f"active:{_day()}"],
+        ["SUNION", *week_keys],
+        ["SCARD", "blocked"],
+        ["GET", "stat:word2pdf"],
+        ["GET", "stat:pdf2word"],
+        ["GET", f"stat:word2pdf:{_day()}"],
+        ["GET", f"stat:pdf2word:{_day()}"],
+    )
+    if not res:
+        await send(update, "⚠️ Couldn't reach the database. Try again shortly.")
+        return
+    total, today, week, blocked, w2p, p2w, w2p_t, p2w_t = res
+    i = lambda v: int(v or 0)  # noqa: E731
+    await send(
+        update,
+        "📊 <b>Bot statistics</b>\n\n"
+        f"👥 Total users: <b>{i(total)}</b>\n"
+        f"🟢 Active today: <b>{i(today)}</b>\n"
+        f"📅 Active last 7 days: <b>{len(week or [])}</b>\n"
+        f"🚫 Blocked the bot: <b>{i(blocked)}</b>\n\n"
+        f"📄 Word → PDF: <b>{i(w2p)}</b> (today {i(w2p_t)})\n"
+        f"📝 PDF → Word: <b>{i(p2w)}</b> (today {i(p2w_t)})",
+    )
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the admin a CSV of all subscribers."""
+    if not _is_admin(update):
+        return
+    ids = ((await redis(["SMEMBERS", "users"])) or [[]])[0]
+    if not ids:
+        await send(update, "No users recorded yet.")
+        return
+    rows = []
+    for n in range(0, len(ids), 100):
+        chunk = ids[n:n + 100]
+        res = await redis(*[["HGETALL", f"user:{u}"] for u in chunk]) or []
+        for uid, flat in zip(chunk, res):
+            d = dict(zip(flat[::2], flat[1::2])) if flat else {}
+            rows.append([uid, d.get("name", ""), d.get("username", ""),
+                         d.get("first_seen", ""), d.get("last_seen", "")])
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["telegram_id", "name", "username", "first_seen", "last_seen"])
+    writer.writerows(rows)
+    await update.effective_chat.send_document(
+        document=io.BytesIO(buf.getvalue().encode("utf-8-sig")),
+        filename="subscribers.csv",
+        caption=f"👥 {len(rows)} subscribers",
+    )
+
+
+_bg_tasks: set = set()
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /broadcast <text>, or reply to any message with /broadcast."""
+    if not _is_admin(update):
+        return
+    msg = update.message
+    if context.bot_data.get("bc_running"):
+        await send(update, "⏳ A broadcast is already running. Please wait for it to finish.")
+        return
+
+    reply = msg.reply_to_message
+    parts = (msg.text or "").split(None, 1)
+    if reply:
+        pending = {"mode": "copy", "chat_id": reply.chat_id, "message_id": reply.message_id}
+    elif len(parts) == 2:
+        pending = {"mode": "text", "text": parts[1]}
+    else:
+        await send(
+            update,
+            "📣 <b>Broadcast</b>\n\n"
+            "• Send <code>/broadcast Your message here</code>\n"
+            "• Or <b>reply</b> to any message (text, photo, file…) with "
+            "<code>/broadcast</code> to send it exactly as it is, with formatting.\n\n"
+            "You'll get a preview and a confirmation button before anything is sent.",
+        )
+        return
+
+    res = await redis(["SMEMBERS", "users"], ["SMEMBERS", "blocked"])
+    if not res:
+        await send(update, "⚠️ Tracking isn't set up or the database is unreachable.")
+        return
+    blocked = set(res[1] or [])
+    targets = [u for u in (res[0] or []) if u not in blocked]
+    if not targets:
+        await send(update, "No active subscribers to message yet.")
+        return
+    pending["targets"] = targets
+    context.bot_data["bc_pending"] = pending
+
+    await update.effective_chat.send_message("👀 <b>Preview</b> (this is what users will receive):",
+                                             parse_mode=ParseMode.HTML)
+    if pending["mode"] == "copy":
+        await context.bot.copy_message(msg.chat_id, pending["chat_id"], pending["message_id"])
+    else:
+        await update.effective_chat.send_message(pending["text"])
+    await send(
+        update,
+        f"Send this to <b>{len(targets)}</b> subscribers?",
+        InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(f"✅ Send to {len(targets)}", callback_data="bc_yes"),
+                InlineKeyboardButton("❌ Cancel", callback_data="bc_no"),
+            ]]
+        ),
+    )
+
+
+async def _deliver(bot, uid: str, pending: dict) -> str:
+    """Send one broadcast message. Returns 'ok', 'blocked' or 'failed'."""
+    for attempt in range(2):
+        try:
+            if pending["mode"] == "copy":
+                await bot.copy_message(int(uid), pending["chat_id"], pending["message_id"])
+            else:
+                await bot.send_message(int(uid), pending["text"])
+            return "ok"
+        except RetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+        except Forbidden:
+            return "blocked"
+        except Exception:  # noqa: BLE001
+            return "failed"
+    return "failed"
+
+
+async def _run_broadcast(app: Application, admin_chat: int, pending: dict) -> None:
+    app.bot_data["bc_running"] = True
+    sent = failed = 0
+    newly_blocked = []
+    try:
+        for uid in pending["targets"]:
+            outcome = await _deliver(app.bot, uid, pending)
+            if outcome == "ok":
+                sent += 1
+            else:
+                failed += 1
+                if outcome == "blocked":
+                    newly_blocked.append(uid)
+            await asyncio.sleep(0.05)  # stay well under Telegram's rate limit
+        if newly_blocked:
+            await redis(*[["SADD", "blocked", u] for u in newly_blocked])
+        await app.bot.send_message(
+            admin_chat,
+            f"📣 <b>Broadcast finished</b>\n\n✅ Delivered: <b>{sent}</b>\n"
+            f"🚫 Failed / blocked: <b>{failed}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        app.bot_data["bc_running"] = False
+
+
+async def on_broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(update):
+        await query.answer()
+        return
+    pending = context.bot_data.pop("bc_pending", None)
+    if query.data == "bc_no" or not pending:
+        await query.answer("Cancelled" if query.data == "bc_no" else "Nothing pending")
+        await query.edit_message_text("❌ Broadcast cancelled.")
+        return
+    if context.bot_data.get("bc_running"):
+        await query.answer("Already running")
+        return
+    await query.answer("Sending…")
+    await query.edit_message_text(
+        f"📤 Sending to {len(pending['targets'])} subscribers… "
+        "I'll message you when it's done."
+    )
+    task = asyncio.create_task(_run_broadcast(context.application, query.message.chat_id, pending))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 # --------------------------------------------------------------------------
@@ -358,9 +632,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if to_pdf:
                 result = await word_to_pdf(src, workdir)
                 out_name = Path(name).stem + ".pdf"
+                await count_conversion("word2pdf")
             else:
                 result = await pdf_to_word(src, workdir)
                 out_name = Path(name).stem + ".docx"
+                await count_conversion("pdf2word")
 
         await status.edit_text("📤 Almost done, sending your file…")
         with open(result, "rb") as fh:
@@ -427,6 +703,12 @@ def main() -> None:
         .build()
     )
 
+    app.add_handler(MessageHandler(filters.ALL, track, block=False), group=-1)
+    app.add_handler(ChatMemberHandler(on_block_change, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CallbackQueryHandler(on_broadcast_button, pattern="^bc_"))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("word2pdf", mode_word_cmd))
